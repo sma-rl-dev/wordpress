@@ -1,0 +1,94 @@
+services:
+  db:
+    image: mysql:8.4
+    container_name: ${CONTAINER_PREFIX:-tester-env-wordpress}-db
+    network_mode: bridge
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-password}
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/mysql-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'mysqladmin ping -h localhost -ppassword']
+      timeout: 5s
+      interval: 5s
+      retries: 20
+      start_period: 60s
+    labels:
+      tester-env.project: ${TESTER_ENV_PROJECT:-tester-env}
+      tester-env.app: wordpress
+      tester-env.scenario: ${TESTER_ENV_SCENARIO:-manual}
+      tester-env.run_id: ${TESTER_ENV_RUN_ID:-default}
+
+  php:
+    image: wordpressdevelop/php:8.5-fpm
+    container_name: ${CONTAINER_PREFIX:-tester-env-wordpress}-php
+    network_mode: bridge
+    links:
+      - db
+    environment:
+      LOCAL_PHP_MEMCACHED: 'false'
+      PHP_FPM_UID: '1000'
+      PHP_FPM_GID: '1000'
+    volumes:
+      - ../:/var/www
+    command: /bin/sh -c "rm -f /var/www/src/wp-content/object-cache.php && exec php-fpm"
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    labels:
+      tester-env.project: ${TESTER_ENV_PROJECT:-tester-env}
+      tester-env.app: wordpress
+      tester-env.scenario: ${TESTER_ENV_SCENARIO:-manual}
+      tester-env.run_id: ${TESTER_ENV_RUN_ID:-default}
+
+  web:
+    image: nginx:alpine
+    container_name: ${WEB_CONTAINER:-tester-env-wordpress-web}
+    network_mode: bridge
+    links:
+      - php
+      - db
+    ports:
+      - "${PORT:-8889}:80"
+    environment:
+      LOCAL_DIR: src
+    volumes:
+      - ../:/var/www
+      - ../tools/local-env/default.template:/etc/nginx/conf.d/default.template:ro
+    command: /bin/sh -c "envsubst '$$LOCAL_DIR' < /etc/nginx/conf.d/default.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+    depends_on:
+      php:
+        condition: service_started
+      db:
+        condition: service_healthy
+    labels:
+      tester-env.project: ${TESTER_ENV_PROJECT:-tester-env}
+      tester-env.app: wordpress
+      tester-env.scenario: ${TESTER_ENV_SCENARIO:-manual}
+      tester-env.run_id: ${TESTER_ENV_RUN_ID:-default}
+
+  cli:
+    image: wordpressdevelop/cli:8.5-fpm
+    network_mode: bridge
+    links:
+      - db
+    volumes:
+      - ../:/var/www
+    entrypoint: wp
+    command: --info
+    profiles: ['cli']
+    labels:
+      tester-env.project: ${TESTER_ENV_PROJECT:-tester-env}
+      tester-env.app: wordpress
+      tester-env.scenario: ${TESTER_ENV_SCENARIO:-manual}
+      tester-env.run_id: ${TESTER_ENV_RUN_ID:-default}
+
+volumes:
+  db-data:
+    name: ${DATA_VOLUME:-wordpress-data}
+    labels:
+      tester-env.project: ${TESTER_ENV_PROJECT:-tester-env}
+      tester-env.app: wordpress
+      tester-env.run_id: ${TESTER_ENV_RUN_ID:-default}

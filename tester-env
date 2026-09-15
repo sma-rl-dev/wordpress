@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# WordPress - tester-env CLI (prospect stage; lives in .work/prospects/wordpress).
+# Source-mounted Nginx + PHP-FPM + MySQL deployment of tag 7.1.0 via tester-env.d overlay.
+# No prebuilt app image: web/php/db are stock upstream images, app code is the
+# editable checkout mounted from the prospect dir (LOCAL_DIR=src pattern).
+set -euo pipefail
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-8889}"
+# PORT may leak in from the outer shell (rl-env exports it); --port overrides.
+CLI_PORT=""
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ADMIN_USER="${WORDPRESS_ADMIN_USER:-admin}"
+ADMIN_PASSWORD="${WORDPRESS_ADMIN_PASSWORD:-password}"
+ADMIN_EMAIL="${WORDPRESS_ADMIN_EMAIL:-test@example.com}"
+DB_PASSWORD="${WORDPRESS_DB_PASSWORD:-password}"
+SITE_TITLE="${WORDPRESS_SITE_TITLE:-WordPress Develop}"
+CLI_IMAGE="wordpressdevelop/cli:8.5-fpm"
+
+refresh_names() {
+  local suffix=""
+  if [[ "${RUN_ID}" != "default" ]]; then suffix="-${RUN_ID}"; fi
+  PROJECT_NAME="tester-env-wordpress${suffix}"
+  DATA_VOLUME="wordpress-data${suffix}"
+  IMAGE_NAME="${IMAGE_TAG:-tester-env-wordpress:dev}"
+  WEB_CONTAINER="tester-env-wordpress-web${suffix}"
+}
+
+usage() {
+  cat <<EOF
+WordPress - tester-env CLI
+
+Usage: ./tester-env [--run-id ID] [--port PORT] <command>
+
+Commands:
+  deploy    Start Nginx+PHP-FPM+MySQL stack, install WordPress from src/
+  seed      Seed deterministic Harbor demo content (idempotent)
+  verify    Assert home/login/admin respond and admin user exists
+  reset     Stop stack and remove DB volume (images kept)
+  stop      Stop stack (preserves data)
+  logs      Tail stack logs
+  status    Show stack status and URL
+  help      Show this help
+
+Env overrides: WORDPRESS_ADMIN_USER, WORDPRESS_ADMIN_PASSWORD,
+  WORDPRESS_ADMIN_EMAIL, WORDPRESS_DB_PASSWORD, WORDPRESS_SITE_TITLE,
+  PORT, RUN_ID, IMAGE_TAG (accepted per CLI pattern; no app image is built).
+
+Defaults: admin / password on http://localhost:8889
+Baseline: tag 7.1.0 (daaca56d3d6a9a42a0c87f6eda766c33a77c1d05)
+EOF
+}
+
+compose() {
+  IMAGE_TAG="${IMAGE_NAME}" DATA_VOLUME="${DATA_VOLUME}" PORT="${PORT}" \
+    CONTAINER_PREFIX="${PROJECT_NAME}" WEB_CONTAINER="${WEB_CONTAINER}" DB_PASSWORD="${DB_PASSWORD}" \
+    TESTER_ENV_RUN_ID="${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+    TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}" \
+    TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}" \
+    docker compose --project-name "${PROJECT_NAME}" \
+      -f "${SCRIPT_DIR}/tester-env.d/docker-compose.tester-env.yml" "$@"
+}
+
+wp_cli() {
+  # WP-CLI one-shot on the default bridge network; db is reachable via --link alias "db".
+  docker run --rm \
+    --label tester-env.project="${TESTER_ENV_PROJECT:-tester-env}" \
+    --label tester-env.app=wordpress \
+    --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+    -v "${SCRIPT_DIR}:/var/www" --link "${PROJECT_NAME}-db:db" \
+    --entrypoint wp "${CLI_IMAGE}" --allow-root --path=/var/www/src "$@"
+}
+
+wait_http() {
+  local url="$1" tries="${2:-60}"
+  for _ in $(seq 1 "$tries"); do
+    if curl --fail --silent --output /dev/null "$url" 2>/dev/null; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+deploy() {
+  refresh_names
+  # Default RUN_ID uses the standard compose project (tester-env-wordpress)
+  # and is (re)started + (re)installed deterministically like any other run id.
+  echo "==> Starting WordPress 7.1.0 stack on http://localhost:${PORT} (project ${PROJECT_NAME})"
+  compose up -d --quiet-pull db php
+  compose up -d --quiet-pull web
+  echo "==> Waiting for installer redirect (wp-config.php must exist; deploy creates it)"
+  if [[ ! -f "${SCRIPT_DIR}/wp-config.php" ]]; then
+    echo "==> Generating wp-config.php (dbhost=db, dbname=wordpress_develop)"
+    echo "x" | compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
+      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
+      config create --dbname=wordpress_develop --dbuser=root \
+      --dbpass="${DB_PASSWORD}" --dbhost=db --force --config-file=wp-config.php 2>&1 | grep -v Deprecated || true
+    compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
+      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
+      config set WP_DEBUG true --raw --type=constant 2>&1 | grep -v Deprecated || true
+    compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
+      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
+      config set WP_ENVIRONMENT_TYPE local --type=constant 2>&1 | grep -v Deprecated || true
+    compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
+      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
+      config set FS_METHOD direct --type=constant 2>&1 | grep -v Deprecated || true
+  fi
+  if ! wait_http "http://localhost:${PORT}/wp-login.php" 60; then
+    echo "!! Web tier did not start. Logs:"; compose logs --tail=30 web php; return 1
+  fi
+  echo "==> Resetting DB and installing '${SITE_TITLE}' (${ADMIN_USER}/<password>)"
+  # wp-config.php is shared across run-ids in this prospect checkout; non-default
+  # runs point DB_HOST at their own db container (php resolves "db" via --link).
+  # The php tier caches the DB connection per worker, so wait until the login
+  # page stops redirecting to install.php before running db reset/install.
+  for _ in $(seq 1 24); do
+    if curl --fail --silent --output /dev/null "http://localhost:${PORT}/wp-login.php" 2>/dev/null \
+      && ! curl --silent "http://localhost:${PORT}/" 2>/dev/null | grep -q "install.php"; then
+      break
+    fi
+    sleep 5
+  done
+  wp_cli config set DB_HOST db 2>&1 | grep -v Deprecated || true
+  wp_cli db reset --yes --defaults 2>&1 | grep -v Deprecated || true
+  wp_cli core install --title="${SITE_TITLE}" --admin_user="${ADMIN_USER}" \
+    --admin_password="${ADMIN_PASSWORD}" --admin_email="${ADMIN_EMAIL}" \
+    --skip-email --url="http://localhost:${PORT}" 2>&1 | grep -v Deprecated
+  wp_cli rewrite structure '/%year%/%monthnum%/%postname%/' 2>&1 | grep -v Deprecated || true
+  if ! wait_http "http://localhost:${PORT}/" 24; then
+    echo "!! Site did not respond after install. Logs:"; compose logs --tail=30 web php; return 1
+  fi
+  echo "==> Ready: http://localhost:${PORT}/ (${ADMIN_USER} / <password>)"
+}
+
+do_seed() {
+  refresh_names
+  echo "==> Seeding deterministic demo content (theme: Harbor support team)"
+  # Settings (idempotent updates).
+  wp_cli option update blogname 'Harbor Support Notes' 2>&1 | grep -v Deprecated || true
+  wp_cli option update blogdescription 'How-to guides from the Harbor support team' 2>&1 | grep -v Deprecated || true
+  wp_cli option update timezone_string 'America/New_York' 2>&1 | grep -v Deprecated || true
+  # Remove stock install content so reruns converge (slugs stable across resets).
+  for slug in hello-world sample-page privacy-policy; do
+    id="$(wp_cli post list --post_type=any --name="${slug}" --format=ids 2>/dev/null | grep -v Deprecated | tr -d ' \n' || true)"
+    if [[ -n "${id}" ]]; then wp_cli post delete "${id}" --force 2>&1 | grep -v Deprecated || true; fi
+  done
+  # Editor user (create once, enforce role/password on reruns).
+  if ! wp_cli user get editor --field=user_login 2>/dev/null | grep -v Deprecated | grep -q editor; then
+    wp_cli user create editor editor@example.com --role=editor \
+      --user_pass='editorpass' --display_name='Dana Editor' 2>&1 | grep -v Deprecated || true
+  fi
+  wp_cli user update editor --role=editor --display_name='Dana Editor' 2>&1 | grep -v Deprecated || true
+  # Taxonomy (slug-keyed upsert).
+  upsert_term category guides 'Guides'
+  upsert_term category release-notes 'Release Notes'
+  upsert_term post_tag onboarding 'onboarding'
+  upsert_term post_tag troubleshooting 'troubleshooting'
+  local guides_id release_id
+  guides_id="$(wp_cli term list category --slug=guides --field=term_id 2>/dev/null | grep -v Deprecated | tr -d ' \n')"
+  release_id="$(wp_cli term list category --slug=release-notes --field=term_id 2>/dev/null | grep -v Deprecated | tr -d ' \n')"
+  # Posts + page (slug-keyed upsert; dates frozen).
+  upsert_post welcome-to-harbor-support post publish 'Welcome to Harbor Support' '2026-01-05 09:00:00' "${guides_id}" 'onboarding' \
+    'We are the Harbor support team. This site collects our how-to guides, release notes, and troubleshooting checklists. Start with the onboarding tag to find setup walkthroughs, or browse Guides by category. If something is missing, leave a comment and we will turn the answer into a new guide.'
+  upsert_post reset-your-password post publish 'How to Reset Your Password' '2026-02-10 14:30:00' "${guides_id}" 'troubleshooting' \
+    'If you cannot sign in, use the Lost your password link on the login screen. Enter your username or email address, open the reset email, and choose a new password within 24 hours. The link expires after one use. If the email does not arrive, check spam, then contact support so we can verify your address.'
+  upsert_post february-release-notes post publish 'February Release Notes: Faster Search' '2026-02-28 10:00:00' "${release_id}" '' \
+    'This month we rebuilt site search. Results now appear as you type, filters combine correctly, and empty searches show popular guides instead of a blank page. We also fixed the sort order on category archives. Report anything odd in the comments and we will investigate.'
+  upsert_post printer-setup-draft post draft 'Draft: Setting Up the Office Printer' '2026-03-02 11:00:00' "${guides_id}" '' \
+    'Work in progress. Steps for connecting the second-floor printer over wifi, including the static IP reservation. Do not publish until facilities confirms the model number.'
+  upsert_post about-support page publish 'About Our Support Team' '2026-01-06 10:00:00' '' '' \
+    'Harbor support covers onboarding, billing, and troubleshooting for all workspace plans. We answer every message within one business day. Office hours are 9am to 5pm Eastern, Monday to Friday.'
+  # Comments: wipe per-post then recreate fixed set (2 approved + 1 pending).
+  seed_comments reset-your-password \
+    'approve|Tom Becker|tom@example.com|2026-02-11 09:15:00|The password reset steps worked on the first try.' \
+    'hold|Sam Reyes|sam@example.com|2026-02-12 16:40:00|Does this also work for accounts with hardware keys?'
+  seed_comments welcome-to-harbor-support \
+    'approve|Priya Nair|priya@example.com|2026-01-06 13:05:00|Thanks - the welcome checklist helped our team get set up in one afternoon.'
+  echo "==> seed OK"
+}
+
+upsert_term() {
+  local taxonomy="$1" slug="$2" name="$3" existing
+  existing="$(wp_cli term list "${taxonomy}" --slug="${slug}" --field=term_id 2>/dev/null | grep -v Deprecated | tr -d ' \n' || true)"
+  if [[ -z "${existing}" ]]; then
+    wp_cli term create "${taxonomy}" "${name}" --slug="${slug}" 2>&1 | grep -v Deprecated || true
+  else
+    wp_cli term update "${taxonomy}" "${existing}" --name="${name}" 2>&1 | grep -v Deprecated || true
+  fi
+}
+
+upsert_post() {
+  local slug="$1" ptype="$2" status="$3" title="$4" date="$5" cat_id="$6" tags="$7" content="$8"
+  local id args
+  id="$(wp_cli post list --post_type=any --name="${slug}" --format=ids 2>/dev/null | grep -v Deprecated | tr -d ' \n' || true)"
+  args=(--post_title="${title}" --post_content="${content}" --post_status="${status}")
+  if [[ -n "${cat_id}" ]]; then args+=(--post_category="${cat_id}"); fi
+  if [[ -n "${tags}" ]]; then args+=(--tags_input="${tags}"); fi
+  if [[ -z "${id}" ]]; then
+    # --post_date is create-only: WP rewrites draft dates to "now" on update.
+    wp_cli post create --post_type="${ptype}" --post_name="${slug}" --post_date="${date}" "${args[@]}" --porcelain 2>&1 | grep -v Deprecated || true
+  else
+    wp_cli post update "${id}" "${args[@]}" 2>&1 | grep -v Deprecated || true
+  fi
+}
+
+seed_comments() {
+  local slug="$1"; shift
+  local post_id spec cstatus author email cdate ctext
+  post_id="$(wp_cli post list --post_type=any --name="${slug}" --field=ID --format=ids 2>/dev/null | grep -v Deprecated | tr -d ' \n')"
+  [[ -n "${post_id}" ]] || { echo "!! seed_comments: post ${slug} missing"; return 1; }
+  local existing
+  existing="$(wp_cli comment list --post_id="${post_id}" --format=ids 2>/dev/null | grep -v Deprecated || true)"
+  if [[ -n "${existing}" ]]; then wp_cli comment delete ${existing} --force 2>&1 | grep -v Deprecated || true; fi
+  for spec in "$@"; do
+    cstatus="${spec%%|*}"; spec="${spec#*|}"
+    author="${spec%%|*}"; spec="${spec#*|}"
+    email="${spec%%|*}"; spec="${spec#*|}"
+    cdate="${spec%%|*}"; ctext="${spec#*|}"
+    wp_cli comment create --comment_post_ID="${post_id}" --comment_author="${author}" \
+      --comment_author_email="${email}" --comment_content="${ctext}" \
+      --comment_date="${cdate}" --comment_approved=$([[ "${cstatus}" == approve ]] && echo 1 || echo 0) \
+      --porcelain 2>&1 | grep -v Deprecated || true
+  done
+}
+
+do_verify() {
+  refresh_names
+  echo "==> Checking http://localhost:${PORT}/ serves 200"
+  curl --fail --silent --output /dev/null "http://localhost:${PORT}/" || { echo "!! home unreachable"; return 1; }
+  echo "==> Checking /wp-login.php serves 200"
+  curl --fail --silent --output /dev/null "http://localhost:${PORT}/wp-login.php" || { echo "!! login unreachable"; return 1; }
+  echo "==> Checking admin user '${ADMIN_USER}' exists"
+  wp_cli user get "${ADMIN_USER}" --field=user_login 2>&1 | grep -v Deprecated | grep -q "${ADMIN_USER}" \
+    || { echo "!! admin user missing"; return 1; }
+  echo "==> Checking seed presence"
+  check_count post "Welcome to Harbor Support" "welcome-to-harbor-support"
+  check_count post "How to Reset Your Password" "reset-your-password"
+  check_count post "February Release Notes: Faster Search" "february-release-notes"
+  check_count post "Draft: Setting Up the Office Printer" "printer-setup-draft"
+  check_count page "About Our Support Team" "about-support"
+  wp_cli user get editor --field=user_login 2>&1 | grep -v Deprecated | grep -q editor \
+    || { echo "!! editor user missing"; return 1; }
+  echo "==> verify OK: home + login respond, admin user present, seed present"
+}
+
+check_count() {
+  local ptype="$1" title="$2" slug="$3" n
+  n="$(wp_cli post list --post_type="${ptype}" --name="${slug}" --format=count 2>/dev/null | grep -v Deprecated | tr -d ' \n' || echo 0)"
+  [[ "${n}" == "1" ]] || { echo "!! seed missing: ${title} (${slug}) count=${n}"; return 1; }
+}
+
+do_reset() {
+  refresh_names
+  echo "==> Resetting ${PROJECT_NAME} + ${DATA_VOLUME} (images kept)"
+  compose down -v
+  echo "==> Reset complete. Run './tester-env deploy' for a clean slate."
+}
+
+# Parse "<command> [--run-id ID] [--port PORT]": flags may come after the command.
+cmd="${1:-help}"
+if [[ "${cmd}" != -* ]]; then shift || true; fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-id) RUN_ID="$2"; shift 2 ;;
+    --port) CLI_PORT="$2"; shift 2 ;;
+    --help|-h) cmd=help; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+# Precedence: --port flag > PORT env (rl-env) > default 8889.
+PORT="${CLI_PORT:-${PORT:-8889}}"
+refresh_names
+case "$cmd" in
+  deploy) deploy ;;
+  seed) do_seed ;;
+  verify) do_verify ;;
+  reset) do_reset ;;
+  stop) compose stop ;;
+  status) compose ps; echo "URL: http://localhost:${PORT}/" ;;
+  logs) compose logs -f ;;
+  help|--help|-h) usage ;;
+  *) echo "Unknown command: $cmd"; usage; exit 1 ;;
+esac
