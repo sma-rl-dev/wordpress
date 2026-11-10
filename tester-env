@@ -63,11 +63,13 @@ compose() {
 
 wp_cli() {
   # WP-CLI one-shot on the default bridge network; db is reachable via --link alias "db".
+  # Explicit workdir so relative file args (e.g. wp-config.php) deterministically
+  # land at the checkout root regardless of image workdir.
   docker run --rm \
     --label tester-env.project="${TESTER_ENV_PROJECT:-tester-env}" \
     --label tester-env.app=wordpress \
     --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
-    -v "${SCRIPT_DIR}:/var/www" --link "${PROJECT_NAME}-db:db" \
+    -v "${SCRIPT_DIR}:/var/www" -w /var/www --link "${PROJECT_NAME}-db:db" \
     --entrypoint wp "${CLI_IMAGE}" --allow-root --path=/var/www/src "$@"
 }
 
@@ -80,6 +82,31 @@ wait_http() {
   return 1
 }
 
+wait_for_db() {
+  # Deterministic actual-DB readiness gate: poll the real TCP path the one-shot
+  # WP-CLI will use (scoped --link alias to this run's compose db service), not
+  # just container health (a localhost ping inside db does not prove bridged TCP
+  # accept from a new container). Fixed bound, labeled; never a blind sleep.
+  local tries=30 i
+  echo "==> [db-ready] Waiting for database TCP accept (db service ${PROJECT_NAME}-db, up to ${tries} tries)"
+  for (( i=1; i<=tries; i++ )); do
+    if docker run --rm \
+      --label tester-env.project="${TESTER_ENV_PROJECT:-tester-env}" \
+      --label tester-env.app=wordpress \
+      --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+      --link "${PROJECT_NAME}-db:db" \
+      --entrypoint mysqladmin mysql:8.4 ping -h db -p"${DB_PASSWORD}" 2>&1 | grep -q "mysqld is alive"; then
+      echo "==> [db-ready] Database TCP accept OK (attempt ${i}/${tries})"
+      return 0
+    fi
+    echo "    [db-ready ${i}/${tries}] mysqld not accepting yet"
+    sleep 2
+  done
+  echo "!! [db-ready] database did not accept connections within ${tries} tries (service ${PROJECT_NAME}-db)" >&2
+  compose logs --tail=30 db || true
+  return 1
+}
+
 deploy() {
   refresh_names
   # Default RUN_ID uses the standard compose project (tester-env-wordpress)
@@ -87,22 +114,23 @@ deploy() {
   echo "==> Starting WordPress 7.1.0 stack on http://localhost:${PORT} (project ${PROJECT_NAME})"
   compose up -d --quiet-pull db php
   compose up -d --quiet-pull web
+  wait_for_db
   echo "==> Waiting for installer redirect (wp-config.php must exist; deploy creates it)"
   if [[ ! -f "${SCRIPT_DIR}/wp-config.php" ]]; then
     echo "==> Generating wp-config.php (dbhost=db, dbname=wordpress_develop)"
-    echo "x" | compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
-      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
-      config create --dbname=wordpress_develop --dbuser=root \
-      --dbpass="${DB_PASSWORD}" --dbhost=db --force --config-file=wp-config.php 2>&1 | grep -v Deprecated || true
-    compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
-      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
-      config set WP_DEBUG true --raw --type=constant 2>&1 | grep -v Deprecated || true
-    compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
-      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
-      config set WP_ENVIRONMENT_TYPE local --type=constant 2>&1 | grep -v Deprecated || true
-    compose run -T --rm --no-deps -v "${SCRIPT_DIR}:/var/www" \
-      --entrypoint wp "${CLI_IMAGE}" --path=/var/www/src \
-      config set FS_METHOD direct --type=constant 2>&1 | grep -v Deprecated || true
+    # NOTE: `compose run` takes a compose SERVICE name, not an image; these use
+    # wp_cli() so the scoped --link <project>-db:db and run labels apply and the
+    # DB check inside `config create --dbhost=db` resolves. Failures propagate
+    # (no || true): a failed config write must abort the deploy, not limp on.
+    echo "x" | wp_cli config create --dbname=wordpress_develop --dbuser=root \
+      --dbpass="${DB_PASSWORD}" --dbhost=db --force --config-file=wp-config.php 2>&1 | grep -v Deprecated \
+      || { echo "!! [config:create] wp_cli config create failed; aborting deploy" >&2; return 1; }
+    wp_cli config set WP_DEBUG true --raw --type=constant 2>&1 | grep -v Deprecated \
+      || { echo "!! [config:set-debug] wp_cli config set WP_DEBUG failed; aborting deploy" >&2; return 1; }
+    wp_cli config set WP_ENVIRONMENT_TYPE local --type=constant 2>&1 | grep -v Deprecated \
+      || { echo "!! [config:set-env] wp_cli config set WP_ENVIRONMENT_TYPE failed; aborting deploy" >&2; return 1; }
+    wp_cli config set FS_METHOD direct --type=constant 2>&1 | grep -v Deprecated \
+      || { echo "!! [config:set-fsmethod] wp_cli config set FS_METHOD failed; aborting deploy" >&2; return 1; }
   fi
   if ! wait_http "http://localhost:${PORT}/wp-login.php" 60; then
     echo "!! Web tier did not start. Logs:"; compose logs --tail=30 web php; return 1
