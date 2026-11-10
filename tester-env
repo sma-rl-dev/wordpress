@@ -64,11 +64,14 @@ compose() {
 wp_cli() {
   # WP-CLI one-shot on the default bridge network; db is reachable via --link alias "db".
   # Explicit workdir so relative file args (e.g. wp-config.php) deterministically
-  # land at the checkout root regardless of image workdir.
+  # land at the checkout root regardless of image workdir. Runs as the invoking
+  # host user: as root it leaves root-owned files (wp-config.php, uploads/) in the
+  # bind-mounted checkout, which then blocks removing the run worktree.
   docker run --rm \
     --label tester-env.project="${TESTER_ENV_PROJECT:-tester-env}" \
     --label tester-env.app=wordpress \
     --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+    --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "${SCRIPT_DIR}:/var/www" -w /var/www --link "${PROJECT_NAME}-db:db" \
     --entrypoint wp "${CLI_IMAGE}" --allow-root --path=/var/www/src "$@"
 }
@@ -107,11 +110,29 @@ wait_for_db() {
   return 1
 }
 
+build_assets() {
+  # wordpress-develop serves src/ directly, but src/wp-includes/js (jquery,
+  # wp-includes script copies) is a gitignored build output: without it
+  # src/index.php dies with "running WordPress without JavaScript and CSS
+  # files", and nothing else in the stack can build it. Same predicate as
+  # src/index.php, so a second deploy skips the work; npm ci is lock-file
+  # pinned. Builds run as the invoking user (never root) so the run worktree
+  # stays removable.
+  if [[ -f "${SCRIPT_DIR}/src/wp-includes/js/jquery/jquery.js" ]]; then
+    return 0
+  fi
+  command -v npm >/dev/null || { echo "!! npm is required to build the WordPress assets" >&2; return 1; }
+  echo "==> Building WordPress assets (npm ci && npm run build:dev)"
+  ( cd "${SCRIPT_DIR}" && npm ci --no-audit --no-fund && npm run build:dev ) \
+    || { echo "!! WordPress asset build failed" >&2; return 1; }
+}
+
 deploy() {
   refresh_names
   # Default RUN_ID uses the standard compose project (tester-env-wordpress)
   # and is (re)started + (re)installed deterministically like any other run id.
   echo "==> Starting WordPress 7.1.0 stack on http://localhost:${PORT} (project ${PROJECT_NAME})"
+  build_assets
   compose up -d --quiet-pull db php
   compose up -d --quiet-pull web
   wait_for_db
