@@ -48,6 +48,10 @@ Env overrides: WORDPRESS_ADMIN_USER, WORDPRESS_ADMIN_PASSWORD,
 
 Defaults: admin / password on http://localhost:8889
 Baseline: tag 7.1.0 (daaca56d3d6a9a42a0c87f6eda766c33a77c1d05)
+
+Canonical site URL: WORDPRESS_SITE_URL wins when set, then the launcher public
+  origin (TESTER_ENV_PUBLIC_ORIGIN), then the runner browser origin
+  (TESTER_ENV_BROWSER_ORIGIN), then http://localhost:<port> for manual runs.
 EOF
 }
 
@@ -132,6 +136,14 @@ deploy() {
   # Default RUN_ID uses the standard compose project (tester-env-wordpress)
   # and is (re)started + (re)installed deterministically like any other run id.
   echo "==> Starting WordPress 7.1.0 stack on http://localhost:${PORT} (project ${PROJECT_NAME})"
+  # Canonical site URL WordPress bakes into the home/siteurl options. A bare
+  # localhost URL is only correct for manual host-side runs: the GUI tester's
+  # browser reaches the app through TESTER_ENV_BROWSER_ORIGIN, so every
+  # absolute link/redirect built from localhost would leave the browser origin.
+  # An explicit operator value wins; the launcher public origin then matches
+  # what src/tester_env/launcher_patches/wordpress-runtime-origin.patch uses.
+  site_url="${WORDPRESS_SITE_URL:-${TESTER_ENV_PUBLIC_ORIGIN:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}}"
+  printf '==> Canonical site URL: %s\n' "${site_url}"
   build_assets
   compose up -d --quiet-pull db php
   compose up -d --quiet-pull web
@@ -177,7 +189,15 @@ deploy() {
   if ! wait_http "http://localhost:${PORT}/" 24; then
     echo "!! Site did not respond after install. Logs:"; compose logs --tail=30 web php; return 1
   fi
-  echo "==> Ready: http://localhost:${PORT}/ (${ADMIN_USER} / <password>)"
+  # Converge home/siteurl on the same value used for the browser-facing URL.
+  # 'wp core install --url' above keeps the historical localhost default (a
+  # pinned launcher hunk owns that line), so without this the front end and
+  # every redirect still point the tester's browser at localhost.
+  wp_cli option update home "${site_url}" 2>&1 | grep -v Deprecated \
+    || { echo "!! [site-url] wp option update home '${site_url}' failed; aborting deploy" >&2; return 1; }
+  wp_cli option update siteurl "${site_url}" 2>&1 | grep -v Deprecated \
+    || { echo "!! [site-url] wp option update siteurl '${site_url}' failed; aborting deploy" >&2; return 1; }
+  echo "==> Ready: ${site_url%/}/ (${ADMIN_USER} / <password>)"
 }
 
 do_seed() {
